@@ -243,8 +243,6 @@ class SimpleCPUOffloadScheduler:
 
         # Store metadata
         self._lazy_mode = lazy_offload
-        # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
-        self._cursor: KVCacheBlock | None = None
         # One snapshot per physical GPU block; validate its hash before reuse.
         self._lazy_block_meta: dict[
             int, tuple[BlockHashWithGroupId, dict[BlockHashWithGroupId, BlockStoreMeta]]
@@ -594,41 +592,30 @@ class SimpleCPUOffloadScheduler:
         list[str],
         list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None,
     ]:
-        """Single-pass cursor walk: offload cached GPU blocks near eviction.
+        """Offload cached GPU blocks in the next eviction window.
 
-        Walks the GPU free queue from the cursor, counting blocks that are
-        free-or-offloaded (safe for the allocator to evict). Stops when
-        target_free blocks are covered or CPU capacity is reached.
+        Walk the first target_free blocks of the GPU free queue in eviction
+        order. This counts unallocated blocks and CPU-backed cached blocks as
+        safe for the allocator to reuse. Copy other cached blocks to CPU before
+        they reach the head; stop when CPU capacity is reached.
         """
         gpu_pool = self._gpu_block_pool
         if gpu_pool is None or self._target_free <= 0:
-            return [], [], [], None
-
-        # Preserve GPU-only cache entries while there is enough free space to
-        # satisfy the next scheduling step. Without this guard the cursor can
-        # catch up to every newly freed block and copy it to CPU immediately.
-        if gpu_pool.get_num_free_blocks() > self._target_free:
             return [], [], [], None
 
         free_queue = gpu_pool.free_block_queue
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
 
-        # Validate cursor: stale if block was removed from free queue.
-        if self._cursor is not None and self._cursor.ref_cnt > 0:
-            self._cursor = None
-
         gpu_ids: list[int] = []
         block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = (
             [] if self.enable_kv_cache_events else None
         )
-        last_visited = self._cursor
-
-        for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
+        # Peek at the next eviction candidates, including unallocated blocks.
+        # A cached block only needs host backing once it enters this window.
+        for covered, node in enumerate(free_queue.iter_blocks_after(None)):
             if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
                 break
-
-            last_visited = node
             bhash = node.block_hash
 
             if (
@@ -642,8 +629,6 @@ class SimpleCPUOffloadScheduler:
                     block_meta.append(
                         snapshot[1] if snapshot and snapshot[0] == bhash else {}
                     )
-
-        self._cursor = last_visited
 
         # Batch-allocate CPU blocks.
         if gpu_ids:
@@ -1521,7 +1506,6 @@ class SimpleCPUOffloadScheduler:
             for event_idx, count in self._store_event_pending_counts.items()
             if event_idx in self._abandoned_store_event_to_blocks
         }
-        self._cursor = None
         self._lazy_block_meta.clear()
         # Seed the fresh counters with outcomes since the last drain so a
         # mid-interval reset() does not drop them from the next report.
