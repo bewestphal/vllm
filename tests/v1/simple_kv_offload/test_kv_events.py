@@ -666,6 +666,7 @@ def test_lazy_store_does_not_publish_stale_metadata_after_gpu_block_reuse() -> N
     gpu_ids, cpu_ids, _, block_meta = sched._prepare_lazy_store_specs()
     assert gpu_ids == [old_block.block_id]
     assert block_meta == [{}]
+    assert old_block.block_id not in sched._lazy_block_meta
     sched._process_store_completion(gpu_ids, cpu_ids, block_meta)
     stored = [event for event in sched.take_events() if isinstance(event, BlockStored)]
     assert len(stored) == 1
