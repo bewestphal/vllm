@@ -880,6 +880,33 @@ def test_lazy_store_and_load_roundtrip() -> None:
     assert len(meta2.load_gpu_blocks) > 0
 
 
+def test_lazy_store_waits_for_gpu_pressure() -> None:
+    """A cached block stays GPU-only until the free pool reaches the watermark."""
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    assert sched._target_free == 8
+
+    req = make_request(num_blocks=2)
+    cached_blocks = _allocate_gpu_blocks(gpu_pool, req, 2)
+    gpu_pool.free_blocks(cached_blocks)
+    assert gpu_pool.get_num_free_blocks() == 31
+
+    # Many GPU blocks remain available: no host copy or duplicate residency.
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event < 0
+    assert get_cpu_free_blocks(sched) == 31  # Block 0 is the null block.
+
+    # Consume the other free blocks. The cached blocks are now near eviction.
+    fillers = gpu_pool.get_new_blocks(23)
+    assert gpu_pool.get_num_free_blocks() == sched._target_free
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event >= 0
+    assert set(meta.store_gpu_blocks) == {b.block_id for b in cached_blocks}
+    simulate_store_completion(sched, meta.store_event)
+    gpu_pool.free_blocks(fillers)
+
+
 # ---------------------------------------------------------------------------
 # Test 2a: Eager duplicate store is skipped
 # ---------------------------------------------------------------------------

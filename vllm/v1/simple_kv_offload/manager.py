@@ -604,6 +604,12 @@ class SimpleCPUOffloadScheduler:
         if gpu_pool is None or self._target_free <= 0:
             return [], [], [], None
 
+        # Preserve GPU-only cache entries while there is enough free space to
+        # satisfy the next scheduling step. Without this guard the cursor can
+        # catch up to every newly freed block and copy it to CPU immediately.
+        if gpu_pool.get_num_free_blocks() > self._target_free:
+            return [], [], [], None
+
         free_queue = gpu_pool.free_block_queue
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
