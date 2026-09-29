@@ -626,6 +626,8 @@ class SimpleCPUOffloadScheduler:
                 gpu_ids.append(node.block_id)
                 if block_meta is not None:
                     snapshot = self._lazy_block_meta.get(node.block_id)
+                    if snapshot and snapshot[0] != bhash:
+                        del self._lazy_block_meta[node.block_id]
                     block_meta.append(
                         snapshot[1] if snapshot and snapshot[0] == bhash else {}
                     )
@@ -817,6 +819,66 @@ class SimpleCPUOffloadScheduler:
         )
         return blocks[0] if blocks else None
 
+    def _build_store_block_meta(
+        self,
+        request: "Request",
+        group_id: int,
+        block_idx: int,
+        primary_hash: BlockHashWithGroupId,
+        resolved_hashes: "BlockHashList",
+        mm_idx: int,
+        secondary_mm_idx: int,
+    ) -> tuple[dict[BlockHashWithGroupId, BlockStoreMeta], int, int]:
+        """Snapshot the metadata for one GPU block and its secondary hashes."""
+        group_size = self.group_block_sizes[group_id]
+        token_start = block_idx * group_size
+        token_end = token_start + group_size
+        lora_req = request.lora_request
+        extra_keys, mm_idx = generate_block_hash_extra_keys(
+            request, token_start, token_end, mm_idx
+        )
+        meta_by_hash = {
+            primary_hash: BlockStoreMeta(
+                token_ids=list(request.all_token_ids[token_start:token_end]),
+                parent_block_hash=(
+                    None
+                    if block_idx == 0
+                    else maybe_convert_block_hash(resolved_hashes[block_idx - 1])
+                ),
+                lora_id=lora_req.adapter_id if lora_req else None,
+                lora_name=lora_req.name if lora_req else None,
+                extra_keys=extra_keys,
+                session_id=request.session_id,
+            )
+        }
+        for hash_idx in range(
+            token_start // self.hash_block_size, token_end // self.hash_block_size
+        ):
+            block_hash = make_block_hash_with_group_id(
+                request.block_hashes[hash_idx], group_id
+            )
+            if block_hash is None or block_hash == primary_hash:
+                continue
+            hash_start = hash_idx * self.hash_block_size
+            hash_end = hash_start + self.hash_block_size
+            secondary_keys, secondary_mm_idx = generate_block_hash_extra_keys(
+                request, hash_start, hash_end, secondary_mm_idx
+            )
+            meta_by_hash[block_hash] = BlockStoreMeta(
+                token_ids=list(request.all_token_ids[hash_start:hash_end]),
+                parent_block_hash=(
+                    None
+                    if hash_idx == 0
+                    else maybe_convert_block_hash(request.block_hashes[hash_idx - 1])
+                ),
+                lora_id=lora_req.adapter_id if lora_req else None,
+                lora_name=lora_req.name if lora_req else None,
+                extra_keys=secondary_keys,
+                session_id=request.session_id,
+                block_size=self.hash_block_size,
+            )
+        return meta_by_hash, mm_idx, secondary_mm_idx
+
     def _select_eager_blocks_to_store(
         self,
         state: StoreRequestState,
@@ -895,62 +957,17 @@ class SimpleCPUOffloadScheduler:
                 gpu_block_ids.append(gpu_block_id)
                 advanced_per_group[g] += 1
                 if block_meta is not None:
-                    token_start = i * group_size
-                    token_end = token_start + group_size
-                    parent_hash = (
-                        None
-                        if i == 0
-                        else maybe_convert_block_hash(resolved_hashes[i - 1])
+                    meta_by_hash, curr_mm_idx, secondary_mm_idx = (
+                        self._build_store_block_meta(
+                            request,
+                            g,
+                            i,
+                            primary_block_hash,
+                            resolved_hashes,
+                            curr_mm_idx,
+                            secondary_mm_idx,
+                        )
                     )
-                    lora_req = request.lora_request
-                    extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                        request, token_start, token_end, curr_mm_idx
-                    )
-                    meta_by_hash = {
-                        primary_block_hash: BlockStoreMeta(
-                            token_ids=list(
-                                request.all_token_ids[token_start:token_end]
-                            ),
-                            parent_block_hash=parent_hash,
-                            lora_id=lora_req.adapter_id if lora_req else None,
-                            lora_name=lora_req.name if lora_req else None,
-                            extra_keys=extra_keys,
-                            session_id=request.session_id,
-                        )
-                    }
-                    first_hash_idx = token_start // self.hash_block_size
-                    last_hash_idx = token_end // self.hash_block_size
-                    for hash_idx in range(first_hash_idx, last_hash_idx):
-                        block_hash = make_block_hash_with_group_id(
-                            request.block_hashes[hash_idx], g
-                        )
-                        if block_hash is None or block_hash == primary_block_hash:
-                            continue
-                        hash_start = hash_idx * self.hash_block_size
-                        hash_end = hash_start + self.hash_block_size
-                        secondary_extra_keys, secondary_mm_idx = (
-                            generate_block_hash_extra_keys(
-                                request,
-                                hash_start,
-                                hash_end,
-                                secondary_mm_idx,
-                            )
-                        )
-                        meta_by_hash[block_hash] = BlockStoreMeta(
-                            token_ids=list(request.all_token_ids[hash_start:hash_end]),
-                            parent_block_hash=(
-                                None
-                                if hash_idx == 0
-                                else maybe_convert_block_hash(
-                                    request.block_hashes[hash_idx - 1]
-                                )
-                            ),
-                            lora_id=lora_req.adapter_id if lora_req else None,
-                            lora_name=lora_req.name if lora_req else None,
-                            extra_keys=secondary_extra_keys,
-                            session_id=request.session_id,
-                            block_size=self.hash_block_size,
-                        )
                     block_meta.append(meta_by_hash)
 
         return gpu_block_ids, advanced_per_group, block_meta
@@ -1240,7 +1257,6 @@ class SimpleCPUOffloadScheduler:
         if gpu_pool is None:
             return
         confirmed_tokens = request.num_computed_tokens - request.num_output_placeholders
-        lora_req = request.lora_request
         for g, group_ids in enumerate(block_ids):
             if g not in self.prefix_cacheable_group_ids:
                 continue
@@ -1261,52 +1277,17 @@ class SimpleCPUOffloadScheduler:
                     continue
                 if make_block_hash_with_group_id(resolved_hashes[i], g) != primary_hash:
                     continue
-                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                    request, token_start, token_end, curr_mm_idx
+                meta_by_hash, curr_mm_idx, secondary_mm_idx = (
+                    self._build_store_block_meta(
+                        request,
+                        g,
+                        i,
+                        primary_hash,
+                        resolved_hashes,
+                        curr_mm_idx,
+                        secondary_mm_idx,
+                    )
                 )
-                meta_by_hash = {
-                    primary_hash: BlockStoreMeta(
-                        token_ids=list(request.all_token_ids[token_start:token_end]),
-                        parent_block_hash=(
-                            None
-                            if i == 0
-                            else maybe_convert_block_hash(resolved_hashes[i - 1])
-                        ),
-                        lora_id=lora_req.adapter_id if lora_req else None,
-                        lora_name=lora_req.name if lora_req else None,
-                        extra_keys=extra_keys,
-                        session_id=request.session_id,
-                    )
-                }
-                for hash_idx in range(
-                    token_start // self.hash_block_size,
-                    token_end // self.hash_block_size,
-                ):
-                    secondary_hash = make_block_hash_with_group_id(
-                        request.block_hashes[hash_idx], g
-                    )
-                    if secondary_hash is None or secondary_hash == primary_hash:
-                        continue
-                    hash_start = hash_idx * self.hash_block_size
-                    hash_end = hash_start + self.hash_block_size
-                    secondary_keys, secondary_mm_idx = generate_block_hash_extra_keys(
-                        request, hash_start, hash_end, secondary_mm_idx
-                    )
-                    meta_by_hash[secondary_hash] = BlockStoreMeta(
-                        token_ids=list(request.all_token_ids[hash_start:hash_end]),
-                        parent_block_hash=(
-                            None
-                            if hash_idx == 0
-                            else maybe_convert_block_hash(
-                                request.block_hashes[hash_idx - 1]
-                            )
-                        ),
-                        lora_id=lora_req.adapter_id if lora_req else None,
-                        lora_name=lora_req.name if lora_req else None,
-                        extra_keys=secondary_keys,
-                        session_id=request.session_id,
-                        block_size=self.hash_block_size,
-                    )
                 self._lazy_block_meta[gpu_id] = (primary_hash, meta_by_hash)
 
     def _queue_finished_eager_store(
