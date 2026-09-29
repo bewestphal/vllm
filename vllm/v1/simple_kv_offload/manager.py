@@ -76,6 +76,7 @@ class BlockStoreMeta:
     lora_id: int | None
     lora_name: str | None
     extra_keys: tuple[Any, ...] | None
+    session_id: str | None
     block_size: int | None = None
 
 
@@ -923,6 +924,7 @@ class SimpleCPUOffloadScheduler:
                             lora_id=lora_req.adapter_id if lora_req else None,
                             lora_name=lora_req.name if lora_req else None,
                             extra_keys=extra_keys,
+                            session_id=request.session_id,
                         )
                     }
                     first_hash_idx = token_start // self.hash_block_size
@@ -955,6 +957,7 @@ class SimpleCPUOffloadScheduler:
                             lora_id=lora_req.adapter_id if lora_req else None,
                             lora_name=lora_req.name if lora_req else None,
                             extra_keys=secondary_extra_keys,
+                            session_id=request.session_id,
                             block_size=self.hash_block_size,
                         )
                     block_meta.append(meta_by_hash)
@@ -1168,6 +1171,7 @@ class SimpleCPUOffloadScheduler:
                                 get_kv_cache_spec_sliding_window(spec)
                             ),
                             locality="LOCAL",
+                            session_id=meta.session_id if meta else None,
                         )
                     )
 
@@ -1280,6 +1284,7 @@ class SimpleCPUOffloadScheduler:
                         lora_id=lora_req.adapter_id if lora_req else None,
                         lora_name=lora_req.name if lora_req else None,
                         extra_keys=extra_keys,
+                        session_id=request.session_id,
                     )
                 }
                 for hash_idx in range(
@@ -1308,6 +1313,7 @@ class SimpleCPUOffloadScheduler:
                         lora_id=lora_req.adapter_id if lora_req else None,
                         lora_name=lora_req.name if lora_req else None,
                         extra_keys=secondary_keys,
+                        session_id=request.session_id,
                         block_size=self.hash_block_size,
                     )
                 self._lazy_block_meta[gpu_id] = (primary_hash, meta_by_hash)

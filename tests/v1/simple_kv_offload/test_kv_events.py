@@ -189,6 +189,7 @@ def _do_eager_store(
     fix: SchedulerFixture,
     num_blocks: int = 2,
     lora_request: LoRARequest | None = None,
+    session_id: str | None = None,
 ) -> tuple[object, Request]:
     """Run an eager store of ``num_blocks`` and complete it.
 
@@ -209,6 +210,7 @@ def _do_eager_store(
         )
     else:
         req = make_request(num_blocks=num_blocks)
+    req.session_id = session_id
     kv_blocks = _alloc_and_register(fix, req, num_blocks)
     sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
     block_ids = kv_blocks.get_block_ids()
@@ -244,7 +246,7 @@ def test_block_stored_per_group_metadata_full_attention() -> None:
     fix = make_events_scheduler()
     sched = fix.scheduler
     assert sched.kv_event_medium == MEDIUM_CPU
-    _, req = _do_eager_store(fix, num_blocks=2)
+    _, req = _do_eager_store(fix, num_blocks=2, session_id="eager-session")
     events = list(sched.take_events())
     stored = [e for e in events if isinstance(e, BlockStored)]
     assert len(stored) == 2
@@ -261,6 +263,7 @@ def test_block_stored_per_group_metadata_full_attention() -> None:
     assert ev.block_hashes == [expected_hash_0]
     assert ev.parent_block_hash is None
     assert ev.token_ids == req.prompt_token_ids[0:BLOCK_SIZE]
+    assert ev.session_id == "eager-session"
 
     # Second block's parent_block_hash equals the first block's hash.
     ev1 = stored[1]
@@ -270,6 +273,7 @@ def test_block_stored_per_group_metadata_full_attention() -> None:
     assert ev1.block_hashes == [expected_hash_1]
     assert ev1.parent_block_hash == expected_hash_0
     assert ev1.token_ids == req.prompt_token_ids[BLOCK_SIZE : 2 * BLOCK_SIZE]
+    assert ev1.session_id == "eager-session"
 
 
 def test_eager_store_lora_metadata() -> None:
@@ -516,6 +520,7 @@ def test_lazy_store_emits_block_stored() -> None:
 
     # Allocate, hash, free -> hashed blocks in free queue.
     req = make_request(num_blocks=2)
+    req.session_id = "lazy-session"
     gpu_blocks = []
     for blk in gpu_pool.get_new_blocks(2):
         gpu_blocks.append(blk)
@@ -550,6 +555,7 @@ def test_lazy_store_emits_block_stored() -> None:
         assert ev.group_idx == 0
         assert ev.kv_cache_spec_kind == "full_attention"
         assert ev.locality == "LOCAL"
+        assert ev.session_id == "lazy-session"
         assert (
             ev.token_ids == req.prompt_token_ids[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
         )
