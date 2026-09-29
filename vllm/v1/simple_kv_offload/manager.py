@@ -67,8 +67,8 @@ logger = init_logger(__name__)
 class BlockStoreMeta:
     """Per-block metadata snapshot for BlockStored event emission.
 
-    Captured at store-prep time (when the Request is available) and carried
-    through TransferMeta to async completion, where the Request is gone.
+    Captured while the Request is available, at eager store prep or at request
+    finish for lazy stores. Carried through TransferMeta to async completion.
     """
 
     token_ids: list[int]
@@ -244,6 +244,7 @@ class SimpleCPUOffloadScheduler:
         self._lazy_mode = lazy_offload
         # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
         self._cursor: KVCacheBlock | None = None
+        # One snapshot per physical GPU block; validate its hash before reuse.
         self._lazy_block_meta: dict[
             int, tuple[BlockHashWithGroupId, dict[BlockHashWithGroupId, BlockStoreMeta]]
         ] = {}

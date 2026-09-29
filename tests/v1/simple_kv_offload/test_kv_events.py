@@ -558,6 +558,115 @@ def test_lazy_store_emits_block_stored() -> None:
         )
 
 
+def test_lazy_store_keeps_metadata_for_multiple_kv_groups() -> None:
+    """Each lazy CPU event describes the group whose block was copied."""
+    kv_config = _make_mixed_kv_cache_config(num_blocks=8, sliding_window=2 * BLOCK_SIZE)
+    fix = make_events_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        num_groups=2,
+        kv_cache_config=kv_config,
+        lazy=True,
+    )
+    sched = fix.scheduler
+    req = make_request(num_blocks=1)
+    group_blocks = tuple(
+        _allocate_gpu_blocks(fix.gpu_block_pool, req, 1, group_id=g) for g in range(2)
+    )
+    req.num_computed_tokens = BLOCK_SIZE
+    sched.request_finished_all_groups(
+        req, tuple([block.block_id for block in blocks] for blocks in group_blocks)
+    )
+    cpu_blocks = sched.cpu_block_pool.get_new_blocks(2)
+    sched._process_store_completion(
+        [blocks[0].block_id for blocks in group_blocks],
+        [block.block_id for block in cpu_blocks],
+        [sched._lazy_block_meta[blocks[0].block_id][1] for blocks in group_blocks],
+    )
+
+    stored = [event for event in sched.take_events() if isinstance(event, BlockStored)]
+    assert len(stored) == 2
+    assert {event.group_idx for event in stored} == {0, 1}
+    assert all(event.token_ids == req.prompt_token_ids[:BLOCK_SIZE] for event in stored)
+
+
+def test_lazy_store_emits_fine_grained_secondary_hash_metadata() -> None:
+    """Lazy offload preserves the shorter token range of a secondary hash."""
+    fix = make_events_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    sched.hash_block_size = BLOCK_SIZE // 2
+    req = Request(
+        request_id="req-lazy-secondary",
+        prompt_token_ids=list(range(BLOCK_SIZE + 1)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE // 2, sha256),
+    )
+    req.num_computed_tokens = BLOCK_SIZE
+    gpu_block = fix.gpu_block_pool.get_new_blocks(1)[0]
+    primary_hash = make_block_hash_with_group_id(req.block_hashes[1], 0)
+    secondary_hash = make_block_hash_with_group_id(req.block_hashes[0], 0)
+    fix.gpu_block_pool._insert_block_hash(
+        primary_hash, gpu_block, num_tokens=BLOCK_SIZE
+    )
+    fix.gpu_block_pool._insert_block_hash(
+        secondary_hash, gpu_block, num_tokens=BLOCK_SIZE // 2
+    )
+    sched.request_finished_all_groups(req, ([gpu_block.block_id],))
+    cpu_block = sched.cpu_block_pool.get_new_blocks(1)[0]
+    sched._process_store_completion(
+        [gpu_block.block_id],
+        [cpu_block.block_id],
+        [sched._lazy_block_meta[gpu_block.block_id][1]],
+    )
+
+    stored = [event for event in sched.take_events() if isinstance(event, BlockStored)]
+    by_hash = {event.block_hashes[0]: event for event in stored}
+    assert (
+        by_hash[maybe_convert_block_hash(req.block_hashes[1])].token_ids
+        == (req.prompt_token_ids[:BLOCK_SIZE])
+    )
+    secondary_event = by_hash[maybe_convert_block_hash(req.block_hashes[0])]
+    assert secondary_event.block_size == BLOCK_SIZE // 2
+    assert secondary_event.token_ids == req.prompt_token_ids[: BLOCK_SIZE // 2]
+
+
+def test_lazy_store_does_not_publish_stale_metadata_after_gpu_block_reuse() -> None:
+    """A recycled block ID cannot publish the previous request's tokens."""
+    fix = make_events_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    old_req = make_request(num_blocks=1)
+    old_block = _allocate_gpu_blocks(gpu_pool, old_req, 1)[0]
+    old_req.num_computed_tokens = BLOCK_SIZE
+    sched.request_finished_all_groups(old_req, ([old_block.block_id],))
+    gpu_pool.free_blocks([old_block])
+
+    allocated = gpu_pool.get_new_blocks(7)
+    assert old_block in allocated
+    new_req = make_request(num_blocks=1)
+    gpu_pool.cache_full_blocks(
+        request=new_req,
+        blocks=[old_block],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=BLOCK_SIZE,
+        kv_cache_group_id=0,
+    )
+    gpu_pool.free_blocks([old_block])
+
+    gpu_ids, cpu_ids, _, block_meta = sched._prepare_lazy_store_specs()
+    assert gpu_ids == [old_block.block_id]
+    assert block_meta == [{}]
+    sched._process_store_completion(gpu_ids, cpu_ids, block_meta)
+    stored = [event for event in sched.take_events() if isinstance(event, BlockStored)]
+    assert len(stored) == 1
+    assert stored[0].block_hashes == [maybe_convert_block_hash(new_req.block_hashes[0])]
+    assert stored[0].token_ids == []
+
+
 # ---------------------------------------------------------------------------
 # cp_world_size scales block_size for non-Mamba
 # ---------------------------------------------------------------------------
