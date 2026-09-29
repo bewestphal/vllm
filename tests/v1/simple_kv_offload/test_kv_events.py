@@ -509,7 +509,7 @@ def test_block_removed_relabeled_medium_cpu() -> None:
 # lazy store emits BlockStored
 # ---------------------------------------------------------------------------
 def test_lazy_store_emits_block_stored() -> None:
-    """Lazy-mode store completion also emits BlockStored with MEDIUM_CPU."""
+    """Lazy CPU stores retain the finished request's routable block metadata."""
     fix = make_events_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
     sched = fix.scheduler
     gpu_pool = fix.gpu_block_pool
@@ -527,6 +527,8 @@ def test_lazy_store_emits_block_stored() -> None:
         block_size=BLOCK_SIZE,
         kv_cache_group_id=0,
     )
+    req.num_computed_tokens = 2 * BLOCK_SIZE
+    sched.request_finished_all_groups(req, ([block.block_id for block in gpu_blocks],))
     gpu_pool.free_blocks(gpu_blocks)
 
     # Push hashed blocks to LRU head (8 total - 1 null = 7 usable; 2 freed
@@ -541,13 +543,19 @@ def test_lazy_store_emits_block_stored() -> None:
     events = list(sched.take_events())
     stored = [e for e in events if isinstance(e, BlockStored)]
     assert len(stored) == 2, f"expected 2 BlockStored, got {len(stored)}"
-    for ev in stored:
+    by_hash = {event.block_hashes[0]: event for event in stored}
+    for i in range(2):
+        ev = by_hash[maybe_convert_block_hash(req.block_hashes[i])]
         assert ev.medium == MEDIUM_CPU
         assert ev.group_idx == 0
         assert ev.kv_cache_spec_kind == "full_attention"
         assert ev.locality == "LOCAL"
-        assert ev.token_ids == []
-        assert ev.parent_block_hash is None
+        assert (
+            ev.token_ids == req.prompt_token_ids[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
+        )
+        assert ev.parent_block_hash == (
+            None if i == 0 else maybe_convert_block_hash(req.block_hashes[i - 1])
+        )
 
 
 # ---------------------------------------------------------------------------

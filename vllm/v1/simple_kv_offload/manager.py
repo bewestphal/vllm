@@ -244,6 +244,9 @@ class SimpleCPUOffloadScheduler:
         self._lazy_mode = lazy_offload
         # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
         self._cursor: KVCacheBlock | None = None
+        self._lazy_block_meta: dict[
+            int, tuple[BlockHashWithGroupId, dict[BlockHashWithGroupId, BlockStoreMeta]]
+        ] = {}
         if self._lazy_mode:
             self._target_free = self._estimate_lazy_target_blocks(
                 kv_cache_config,
@@ -608,6 +611,9 @@ class SimpleCPUOffloadScheduler:
             self._cursor = None
 
         gpu_ids: list[int] = []
+        block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = (
+            [] if self.enable_kv_cache_events else None
+        )
         last_visited = self._cursor
 
         for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
@@ -623,6 +629,11 @@ class SimpleCPUOffloadScheduler:
                 and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
             ):
                 gpu_ids.append(node.block_id)
+                if block_meta is not None:
+                    snapshot = self._lazy_block_meta.get(node.block_id)
+                    block_meta.append(
+                        snapshot[1] if snapshot and snapshot[0] == bhash else {}
+                    )
 
         self._cursor = last_visited
 
@@ -635,7 +646,7 @@ class SimpleCPUOffloadScheduler:
         else:
             cpu_ids = []
 
-        return gpu_ids, cpu_ids, [], None
+        return gpu_ids, cpu_ids, [], block_meta
 
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -1221,8 +1232,84 @@ class SimpleCPUOffloadScheduler:
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        if self._lazy_mode and self.enable_kv_cache_events:
+            self._capture_lazy_block_metadata(request, block_ids)
         self._queue_finished_eager_store(request, block_ids)
         return self.request_finished(request, block_ids=[])
+
+    def _capture_lazy_block_metadata(
+        self, request: "Request", block_ids: tuple[list[int], ...]
+    ) -> None:
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None:
+            return
+        confirmed_tokens = request.num_computed_tokens - request.num_output_placeholders
+        lora_req = request.lora_request
+        for g, group_ids in enumerate(block_ids):
+            if g not in self.prefix_cacheable_group_ids:
+                continue
+            group_size = self.group_block_sizes[g]
+            resolved_hashes = resolve_block_hashes(
+                request.block_hashes, self.hash_block_size, group_size
+            )
+            curr_mm_idx = 0
+            secondary_mm_idx = 0
+            for i, gpu_id in enumerate(group_ids):
+                token_start = i * group_size
+                token_end = token_start + group_size
+                if token_end > confirmed_tokens or i >= len(resolved_hashes):
+                    break
+                gpu_block = gpu_pool.blocks[gpu_id]
+                primary_hash = gpu_block.block_hash
+                if gpu_block.is_null or primary_hash is None:
+                    continue
+                if make_block_hash_with_group_id(resolved_hashes[i], g) != primary_hash:
+                    continue
+                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                    request, token_start, token_end, curr_mm_idx
+                )
+                meta_by_hash = {
+                    primary_hash: BlockStoreMeta(
+                        token_ids=list(request.all_token_ids[token_start:token_end]),
+                        parent_block_hash=(
+                            None
+                            if i == 0
+                            else maybe_convert_block_hash(resolved_hashes[i - 1])
+                        ),
+                        lora_id=lora_req.adapter_id if lora_req else None,
+                        lora_name=lora_req.name if lora_req else None,
+                        extra_keys=extra_keys,
+                    )
+                }
+                for hash_idx in range(
+                    token_start // self.hash_block_size,
+                    token_end // self.hash_block_size,
+                ):
+                    secondary_hash = make_block_hash_with_group_id(
+                        request.block_hashes[hash_idx], g
+                    )
+                    if secondary_hash is None or secondary_hash == primary_hash:
+                        continue
+                    hash_start = hash_idx * self.hash_block_size
+                    hash_end = hash_start + self.hash_block_size
+                    secondary_keys, secondary_mm_idx = generate_block_hash_extra_keys(
+                        request, hash_start, hash_end, secondary_mm_idx
+                    )
+                    meta_by_hash[secondary_hash] = BlockStoreMeta(
+                        token_ids=list(request.all_token_ids[hash_start:hash_end]),
+                        parent_block_hash=(
+                            None
+                            if hash_idx == 0
+                            else maybe_convert_block_hash(
+                                request.block_hashes[hash_idx - 1]
+                            )
+                        ),
+                        lora_id=lora_req.adapter_id if lora_req else None,
+                        lora_name=lora_req.name if lora_req else None,
+                        extra_keys=secondary_keys,
+                        block_size=self.hash_block_size,
+                    )
+                self._lazy_block_meta[gpu_id] = (primary_hash, meta_by_hash)
 
     def _queue_finished_eager_store(
         self, request: "Request", block_ids: tuple[list[int], ...]
@@ -1422,6 +1509,7 @@ class SimpleCPUOffloadScheduler:
             if event_idx in self._abandoned_store_event_to_blocks
         }
         self._cursor = None
+        self._lazy_block_meta.clear()
         # Seed the fresh counters with outcomes since the last drain so a
         # mid-interval reset() does not drop them from the next report.
         undrained = BoundaryStoreStats(
