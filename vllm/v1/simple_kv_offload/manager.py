@@ -37,7 +37,9 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     MambaSpec,
     SlidingWindowSpec,
     get_kv_cache_spec_kind,
@@ -359,6 +361,17 @@ class SimpleCPUOffloadScheduler:
                 target += cdiv(spec.sliding_window, block_size) + 1 + sequence_margin
             else:
                 target += cdiv(max_num_batched_tokens, block_size) + sequence_margin
+        # Scratch groups share the same GPU block pool. They never need host
+        # backing, but their allocations can evict cached blocks before the
+        # next lazy scan. Kpool tails and circular rings each hold one block
+        # per active sequence, independently of their token block size.
+        for g in kv_cache_config.kv_cache_groups:
+            spec = g.kv_cache_spec
+            if spec.prefix_cacheable or not isinstance(
+                spec, (KpoolTailSpec, CircularBufferSpec)
+            ):
+                continue
+            target += max_num_seqs
         return int(target * (1 + WATERMARK_RATIO))
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:

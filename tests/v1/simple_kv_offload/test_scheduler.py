@@ -3132,18 +3132,24 @@ def test_qsa_ring_group_is_never_stored_or_loaded() -> None:
     assert len(meta2.load_cpu_blocks) == num_blocks
 
 
-def test_lazy_target_blocks_ignore_non_prefix_cacheable_groups() -> None:
-    with_ring = _make_qsa_hybrid_kv_cache_config(num_blocks=16)
-    without_ring = KVCacheConfig(
-        num_blocks=16,
-        kv_cache_tensors=with_ring.kv_cache_tensors[:1],
-        kv_cache_groups=with_ring.kv_cache_groups[:1],
-    )
+def test_lazy_target_blocks_cover_shared_pool_scratch_allocations() -> None:
     max_batched = 64
-    target_with = SimpleCPUOffloadScheduler._estimate_lazy_target_blocks(
-        with_ring, max_batched
-    )
-    target_without = SimpleCPUOffloadScheduler._estimate_lazy_target_blocks(
-        without_ring, max_batched
-    )
-    assert target_with == target_without
+    max_seqs = 16
+    for with_scratch in (
+        _make_qsa_hybrid_kv_cache_config(num_blocks=16),
+        _make_scratch_kv_cache_config(num_blocks=16),
+    ):
+        without_scratch = KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=with_scratch.kv_cache_tensors[:1],
+            kv_cache_groups=with_scratch.kv_cache_groups[:1],
+        )
+        target_with = SimpleCPUOffloadScheduler._estimate_lazy_target_blocks(
+            with_scratch, max_batched, max_num_seqs=max_seqs
+        )
+        target_without = SimpleCPUOffloadScheduler._estimate_lazy_target_blocks(
+            without_scratch, max_batched, max_num_seqs=max_seqs
+        )
+        # The scratch block is never offloaded, but sixteen concurrent
+        # requests can allocate sixteen of them from the shared GPU pool.
+        assert target_with - target_without == 2 * max_seqs
