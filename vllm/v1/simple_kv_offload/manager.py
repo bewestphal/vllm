@@ -252,6 +252,16 @@ class SimpleCPUOffloadScheduler:
                 kv_cache_config,
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.cp_world_size,
+                vllm_config.scheduler_config.max_num_seqs,
+                vllm_config.num_lookahead_tokens,
+            )
+            logger.info(
+                "SimpleCPU lazy eviction window: %d GPU blocks "
+                "(batched_tokens=%d, max_seqs=%d, lookahead=%d)",
+                self._target_free,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.scheduler_config.max_num_seqs,
+                vllm_config.num_lookahead_tokens,
             )
         else:
             self._target_free = 0
@@ -316,19 +326,39 @@ class SimpleCPUOffloadScheduler:
         kv_cache_config: "KVCacheConfig",
         max_num_batched_tokens: int,
         cp_world_size: int = 1,
+        max_num_seqs: int = 0,
+        num_lookahead_tokens: int = 0,
     ) -> int:
-        """GPU blocks to keep available (free/offloaded) per step in lazy mode."""
+        """GPU blocks to back before a burst can reuse the free-queue head.
+
+        Batched tokens alone undercount allocations: each running sequence can
+        cross a different block boundary in one step, and speculative decode
+        reserves additional lookahead slots per sequence. The scheduler scans
+        for offloads after allocating those blocks, so the previous scan must
+        cover that per-sequence rounding margin.
+        """
         WATERMARK_RATIO = 1.0  # Reserve larger space to avoid running out of GPU blocks
         target = 0
         for g in kv_cache_config.prefix_cacheable_groups:
             spec = g.kv_cache_spec
             block_size = resolve_dcp_kv_block_size(spec, cp_world_size)
+            sequence_margin = max_num_seqs * (
+                1 + cdiv(num_lookahead_tokens, block_size)
+            )
             if isinstance(spec, MambaSpec):
-                target += 2
+                # Align mode allocates a position-indexed state block for
+                # every block of a prefill chunk before retiring old states.
+                # The two resident states are not a per-step allocation cap.
+                mamba_step_blocks = (
+                    cdiv(max_num_batched_tokens, block_size)
+                    if spec.mamba_cache_mode == "align"
+                    else 2
+                )
+                target += mamba_step_blocks + sequence_margin
             elif isinstance(spec, SlidingWindowSpec):
-                target += cdiv(spec.sliding_window, block_size) + 1
+                target += cdiv(spec.sliding_window, block_size) + 1 + sequence_margin
             else:
-                target += cdiv(max_num_batched_tokens, block_size)
+                target += cdiv(max_num_batched_tokens, block_size) + sequence_margin
         return int(target * (1 + WATERMARK_RATIO))
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:

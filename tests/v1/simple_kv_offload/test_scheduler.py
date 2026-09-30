@@ -882,10 +882,10 @@ def test_lazy_store_and_load_roundtrip() -> None:
 
 def test_lazy_store_peeks_at_eviction_candidates() -> None:
     """Sequentially cached blocks stay GPU-only until they near eviction."""
-    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=32, lazy=True)
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=64, lazy=True)
     sched = fix.scheduler
     gpu_pool = fix.gpu_block_pool
-    assert sched._target_free == 8
+    assert sched._target_free == 40
 
     first_blocks = None
     for i in range(11):
@@ -896,22 +896,55 @@ def test_lazy_store_peeks_at_eviction_candidates() -> None:
             first_blocks = blocks
         # Completed requests return cached blocks to the free queue. The count
         # stays high even as the unallocated blocks at its head are consumed.
-        assert gpu_pool.get_num_free_blocks() == 31
+        assert gpu_pool.get_num_free_blocks() == 63
         meta = sched.build_connector_meta(make_scheduler_output({}))
         assert meta.store_event < 0
     assert get_cpu_free_blocks(sched) == 31  # Block 0 is the null block.
 
-    # After caching 24 blocks, seven unallocated blocks remain at the LRU
-    # head. The eighth candidate is the first cached block and needs backing.
+    # After caching 24 blocks, 39 unallocated blocks remain at the LRU
+    # head. The fortieth candidate is the first cached block and needs backing.
     req = make_request(num_blocks=2)
     blocks = _allocate_gpu_blocks(gpu_pool, req, 2)
     gpu_pool.free_blocks(blocks)
-    assert gpu_pool.get_num_free_blocks() == 31
+    assert gpu_pool.get_num_free_blocks() == 63
     meta = sched.build_connector_meta(make_scheduler_output({}))
     assert meta.store_event >= 0
     assert first_blocks is not None
     assert meta.store_gpu_blocks == [first_blocks[0].block_id]
     simulate_store_completion(sched, meta.store_event)
+
+
+def test_lazy_store_backs_blocks_before_concurrent_boundary_crossings() -> None:
+    """A decode step can allocate one block per sequence despite a small token sum.
+
+    The store scan runs after scheduling. With 16 sequences crossing a block
+    boundary together, a window based only on 64 batched tokens / 16 tokens
+    per block would cover eight blocks and lose the first cached block here.
+    """
+    fix = make_scheduler(num_cpu_blocks=64, num_gpu_blocks=64, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    assert sched._target_free >= 16
+
+    first_req = make_request(num_blocks=2)
+    first_blocks = _allocate_gpu_blocks(gpu_pool, first_req, 2)
+    gpu_pool.free_blocks(first_blocks)
+    for _ in range(23):
+        req = make_request(num_blocks=2)
+        blocks = _allocate_gpu_blocks(gpu_pool, req, 2)
+        gpu_pool.free_blocks(blocks)
+
+    # 48 blocks are cached, leaving 15 unallocated slots before the first
+    # cached block at the queue head. Store completion makes the old prefix
+    # available on CPU before the following scheduling step.
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event >= 0
+    simulate_store_completion(sched, meta.store_event)
+
+    burst = gpu_pool.get_new_blocks(16)
+    first_hash = make_block_hash_with_group_id(first_req.block_hashes[0], 0)
+    assert sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(first_hash)
+    gpu_pool.free_blocks(burst)
 
 
 # ---------------------------------------------------------------------------
@@ -2267,6 +2300,22 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+
+def test_lazy_target_covers_align_mamba_prefill_blocks() -> None:
+    """Align-mode Mamba can allocate one state block per prefill block."""
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_gpu_blocks=128,
+        attention_block_size=BLOCK_SIZE,
+        block_size=4,
+        scheduler_block_size=BLOCK_SIZE,
+        hash_block_size=4,
+        dcp_world_size=1,
+        lazy=True,
+    )
+    # A 64-token prefill can consume 16 four-token Mamba blocks before old
+    # states are retired. Two resident states are not enough headroom.
+    assert fix.scheduler._target_free >= 2 * (64 // 4)
 
 
 def _make_hybrid_attention_mamba_scheduler(
