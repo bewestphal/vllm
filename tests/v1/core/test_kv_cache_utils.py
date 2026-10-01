@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib
 import mmap
+import random
 import subprocess
 import sys
 from collections.abc import Callable
@@ -807,6 +808,88 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+@pytest.mark.skip_global_cleanup
+def test_free_queue_cursor_only_visits_new_window_entries():
+    blocks = [KVCacheBlock(block_id=i) for i in range(8)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    cursor = queue.create_window_cursor(4)
+    assert list(cursor.iter_new_blocks()) == blocks[:4]
+    assert list(cursor.iter_new_blocks()) == []
+
+    # Moving the old cursor block to the tail must not follow it past the window.
+    queue.remove(blocks[3])
+    queue.append(blocks[3])
+    assert list(cursor.iter_new_blocks()) == [blocks[4]]
+
+    allocated = queue.popleft_n(2)
+    assert list(cursor.iter_new_blocks()) == blocks[5:7]
+    queue.prepend_n(allocated)
+    assert list(cursor.iter_new_blocks()) == allocated
+    assert list(cursor.iter_new_blocks()) == []
+
+    cursor.reset()
+    assert list(cursor.iter_new_blocks()) == queue.get_all_free_blocks()[:4]
+
+
+@pytest.mark.skip_global_cleanup
+def test_free_queue_cursor_resumes_after_partial_scan_and_requeue():
+    """CPU capacity can end a scan before the cursor fills its window."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    cursor = queue.create_window_cursor(3)
+    scan = cursor.iter_new_blocks()
+    assert next(scan) is blocks[0]
+    scan.close()
+    queue.remove(blocks[0])
+    queue.append(blocks[0])
+    assert list(cursor.iter_new_blocks()) == blocks[1:4]
+
+    block = queue.popleft()
+    queue.prepend_n([block])
+    assert list(cursor.iter_new_blocks()) == [block]
+    assert list(cursor.iter_new_blocks()) == []
+
+
+@pytest.mark.parametrize("window_size", [1, 4, 16])
+@pytest.mark.skip_global_cleanup
+def test_free_queue_cursor_tracks_mixed_queue_mutations(window_size):
+    """Allocation, touches, and returns preserve the bounded scan frontier."""
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(block_id=i) for i in range(16)])
+    cursor = queue.create_window_cursor(window_size)
+    rng = random.Random(42)
+    checked: set[int] = set()
+    active: list[KVCacheBlock] = []
+
+    for _ in range(200):
+        free = queue.get_all_free_blocks()
+        operation = rng.choice(("pop", "pop_many", "touch", "append", "prepend"))
+        if free and operation in ("pop", "pop_many", "touch"):
+            if operation == "pop":
+                removed = [queue.popleft()]
+            elif operation == "pop_many":
+                removed = queue.popleft_n(min(3, len(free)))
+            else:
+                removed = [rng.choice(free)]
+                queue.remove(removed[0])
+            active.extend(removed)
+            checked.difference_update(b.block_id for b in removed)
+        elif active and operation in ("append", "prepend"):
+            returned = active[:3]
+            del active[:3]
+            if operation == "prepend":
+                queue.prepend_n(returned)
+            elif len(returned) == 1:
+                queue.append(returned[0])
+            else:
+                queue.append_n(returned)
+
+        window = queue.get_all_free_blocks()[:window_size]
+        expected = [b.block_id for b in window if b.block_id not in checked]
+        assert [b.block_id for b in cursor.iter_new_blocks()] == expected
+        checked = {b.block_id for b in window}
+        assert list(cursor.iter_new_blocks()) == []
 
 
 def test_generate_block_hash_extra_keys():

@@ -6,7 +6,7 @@ import copy
 import hashlib
 import math
 import os
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -269,6 +269,7 @@ class FreeKVCacheBlockQueue:
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
+        self._window_cursors: list[FreeKVCacheBlockQueueCursor] = []
 
         # Initialize doubly links of consecutive blocks
         for i in range(self.num_free_blocks):
@@ -329,6 +330,8 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_head.next_free_block = first_block.next_free_block
         first_block.next_free_block.prev_free_block = self.fake_free_list_head
 
+        for cursor in self._window_cursors:
+            cursor._remove(first_block)
         # Remove the block from the linked list.
         first_block.prev_free_block = first_block.next_free_block = None
 
@@ -362,6 +365,9 @@ class FreeKVCacheBlockQueue:
             last_block.prev_free_block = None
             last_block.next_free_block = None
 
+        for cursor in self._window_cursors:
+            cursor._remove_many(ret)
+
         if curr_block is not None:
             # The queue is not empty, connect the fake head to
             # the new first block.
@@ -381,6 +387,8 @@ class FreeKVCacheBlockQueue:
             # It indicates a bug in the caller's logic.
             raise RuntimeError(f"remove() called on an invalid block: {block}")
 
+        for cursor in self._window_cursors:
+            cursor._remove(block)
         # Link the previous block to the next block.
         block.prev_free_block.next_free_block = block.next_free_block
         # Link the next block to the previous block.
@@ -434,6 +442,9 @@ class FreeKVCacheBlockQueue:
         first_block.prev_free_block = prev_block
 
         self.num_free_blocks += len(blocks)
+
+        for cursor in self._window_cursors:
+            cursor._prepend(blocks)
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
@@ -495,6 +506,71 @@ class FreeKVCacheBlockQueue:
         while curr_block is not None and curr_block is not self.fake_free_list_tail:
             yield curr_block
             curr_block = curr_block.next_free_block
+
+    def create_window_cursor(self, window_size: int) -> "FreeKVCacheBlockQueueCursor":
+        cursor = FreeKVCacheBlockQueueCursor(self, window_size)
+        self._window_cursors.append(cursor)
+        return cursor
+
+
+class FreeKVCacheBlockQueueCursor:
+    """Incrementally visit the first ``window_size`` free blocks.
+
+    Queue mutations maintain the visited prefix, so a subsequent scan only
+    visits prepended blocks and blocks newly entering the window. Call reset
+    when previously visited blocks need to be inspected again.
+    """
+
+    def __init__(self, queue: FreeKVCacheBlockQueue, window_size: int) -> None:
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        self._queue = queue
+        self._window_size = window_size
+        self._window: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self._pending: OrderedDict[int, KVCacheBlock] = OrderedDict()
+
+    def reset(self) -> None:
+        self._window.clear()
+        self._pending.clear()
+
+    def close(self) -> None:
+        self._queue._window_cursors.remove(self)
+        self.reset()
+
+    def _remove(self, block: KVCacheBlock) -> None:
+        self._window.pop(block.block_id, None)
+        self._pending.pop(block.block_id, None)
+
+    def _remove_many(self, blocks: list[KVCacheBlock]) -> None:
+        for block in blocks:
+            self._remove(block)
+
+    def _prepend(self, blocks: list[KVCacheBlock]) -> None:
+        for block in reversed(blocks):
+            self._window[block.block_id] = block
+            self._window.move_to_end(block.block_id, last=False)
+            self._pending[block.block_id] = block
+            self._pending.move_to_end(block.block_id, last=False)
+        while len(self._window) > self._window_size:
+            block_id, _ = self._window.popitem()
+            self._pending.pop(block_id, None)
+
+    def iter_new_blocks(self) -> Iterator[KVCacheBlock]:
+        while self._pending:
+            _, block = self._pending.popitem(last=False)
+            yield block
+
+        while len(self._window) < self._window_size:
+            cursor = next(reversed(self._window.values()), None)
+            block = (
+                cursor.next_free_block
+                if cursor is not None
+                else self._queue.fake_free_list_head.next_free_block
+            )
+            if block is None or block is self._queue.fake_free_list_tail:
+                break
+            self._window[block.block_id] = block
+            yield block
 
 
 def _gen_mm_extra_hash_keys(
