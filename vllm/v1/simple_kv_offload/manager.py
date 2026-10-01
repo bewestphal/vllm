@@ -27,6 +27,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     ExternalBlockHash,
+    FreeKVCacheBlockQueueCursor,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -245,6 +246,7 @@ class SimpleCPUOffloadScheduler:
 
         # Store metadata
         self._lazy_mode = lazy_offload
+        self._cursor: FreeKVCacheBlockQueueCursor | None = None
         # One snapshot per physical GPU block; validate its hash before reuse.
         self._lazy_block_meta: dict[
             int, tuple[BlockHashWithGroupId, dict[BlockHashWithGroupId, BlockStoreMeta]]
@@ -377,7 +379,14 @@ class SimpleCPUOffloadScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
+        if self._cursor is not None:
+            self._cursor.close()
+            self._cursor = None
         self._gpu_block_pool = gpu_block_pool
+        if self._lazy_mode and self._target_free > 0:
+            self._cursor = gpu_block_pool.free_block_queue.create_window_cursor(
+                self._target_free
+            )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -637,28 +646,25 @@ class SimpleCPUOffloadScheduler:
     ]:
         """Offload cached GPU blocks in the next eviction window.
 
-        Walk the first target_free blocks of the GPU free queue in eviction
-        order. This counts unallocated blocks and CPU-backed cached blocks as
-        safe for the allocator to reuse. Copy other cached blocks to CPU before
-        they reach the head; stop when CPU capacity is reached.
+        Resume the cursor within the first target_free blocks, inspecting only
+        blocks newly entering that window. Revisit the window when CPU eviction
+        invalidates previously checked backing copies.
         """
         gpu_pool = self._gpu_block_pool
         if gpu_pool is None or self._target_free <= 0:
             return [], [], [], None
 
-        free_queue = gpu_pool.free_block_queue
         cpu_pool = self.cpu_block_pool
         num_cpu_free = cpu_pool.get_num_free_blocks()
+        if num_cpu_free == 0:
+            return [], [], [], [] if self.enable_kv_cache_events else None
+        assert self._cursor is not None
 
         gpu_ids: list[int] = []
         block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = (
             [] if self.enable_kv_cache_events else None
         )
-        # Peek at the next eviction candidates, including unallocated blocks.
-        # A cached block only needs host backing once it enters this window.
-        for covered, node in enumerate(free_queue.iter_blocks_after(None)):
-            if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
-                break
+        for node in self._cursor.iter_new_blocks():
             bhash = node.block_hash
 
             if (
@@ -674,10 +680,16 @@ class SimpleCPUOffloadScheduler:
                     block_meta.append(
                         snapshot[1] if snapshot and snapshot[0] == bhash else {}
                     )
+                if len(gpu_ids) == num_cpu_free:
+                    break
 
         # Batch-allocate CPU blocks.
         if gpu_ids:
+            num_cached_hashes = len(cpu_pool.cached_block_hash_to_block)
             cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+            # A lost CPU hash can invalidate backing checked by an earlier scan.
+            if len(cpu_pool.cached_block_hash_to_block) < num_cached_hashes:
+                self._cursor.reset()
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             # Touch GPU blocks to prevent eviction during async copy.
             gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
@@ -1531,6 +1543,8 @@ class SimpleCPUOffloadScheduler:
             if event_idx in self._abandoned_store_event_to_blocks
         }
         self._lazy_block_meta.clear()
+        if self._cursor is not None:
+            self._cursor.reset()
         # Seed the fresh counters with outcomes since the last drain so a
         # mid-interval reset() does not drop them from the next report.
         undrained = BoundaryStoreStats(

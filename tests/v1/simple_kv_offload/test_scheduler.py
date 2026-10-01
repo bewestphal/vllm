@@ -914,6 +914,59 @@ def test_lazy_store_peeks_at_eviction_candidates() -> None:
     simulate_store_completion(sched, meta.store_event)
 
 
+def test_lazy_store_does_not_follow_scan_cursor_past_eviction_window() -> None:
+    """A prior scan must not pull tail blocks into the next eviction window."""
+    fix = make_scheduler(num_cpu_blocks=32, num_gpu_blocks=64, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    assert sched._target_free == 40
+
+    for _ in range(2):
+        req = make_request(num_blocks=2)
+        blocks = _allocate_gpu_blocks(gpu_pool, req, 2)
+        gpu_pool.free_blocks(blocks)
+        # At least 59 untouched blocks still precede every cached block.
+        assert all(
+            block.block_hash is None
+            for block in gpu_pool.free_block_queue.get_all_free_blocks()[:40]
+        )
+        meta = sched.build_connector_meta(make_scheduler_output({}))
+        assert meta.store_event < 0
+
+    assert get_cpu_free_blocks(sched) == 31
+
+
+def test_lazy_cursor_rechecks_gpu_blocks_after_cpu_backing_is_evicted() -> None:
+    """A checked GPU block becomes unsafe again when its host copy is reused."""
+    fix = make_scheduler(num_cpu_blocks=2, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+    req_a = make_request(num_blocks=1)
+    req_b = make_request(num_blocks=1)
+    blocks_a = _allocate_gpu_blocks(gpu_pool, req_a, 1)
+    blocks_b = _allocate_gpu_blocks(gpu_pool, req_b, 1)
+    gpu_pool.get_new_blocks(5)
+
+    gpu_pool.free_blocks(blocks_a)
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_gpu_blocks == [blocks_a[0].block_id]
+    simulate_store_completion(sched, meta.store_event)
+    # The cursor now checks A as CPU-backed and leaves it at the queue head.
+    assert sched.build_connector_meta(make_scheduler_output({})).store_event < 0
+    hash_a = make_block_hash_with_group_id(req_a.block_hashes[0], 0)
+    assert sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(hash_a)
+
+    gpu_pool.free_blocks(blocks_b)
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_gpu_blocks == [blocks_b[0].block_id]
+    assert sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(hash_a) is None
+    simulate_store_completion(sched, meta.store_event)
+
+    # A never moved, but losing its CPU copy requires another inspection.
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_gpu_blocks == [blocks_a[0].block_id]
+
+
 def test_lazy_store_backs_blocks_before_concurrent_boundary_crossings() -> None:
     """A decode step can allocate one block per sequence despite a small token sum.
 
