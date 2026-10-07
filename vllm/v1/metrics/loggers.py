@@ -1243,15 +1243,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_queue_time_request[engine_idx].observe(
                 finished_request.queued_time
             )
-            self.histogram_prefill_time_request[engine_idx].observe(
-                finished_request.prefill_time
-            )
-            self.histogram_inference_time_request[engine_idx].observe(
-                finished_request.inference_time
-            )
-            self.histogram_decode_time_request[engine_idx].observe(
-                finished_request.decode_time
-            )
+            if not finished_request.never_started:
+                self.histogram_prefill_time_request[engine_idx].observe(
+                    finished_request.prefill_time
+                )
+                self.histogram_inference_time_request[engine_idx].observe(
+                    finished_request.inference_time
+                )
+                self.histogram_decode_time_request[engine_idx].observe(
+                    finished_request.decode_time
+                )
             self.histogram_request_num_preemptions[engine_idx].observe(
                 finished_request.num_preemptions
             )
@@ -1259,18 +1260,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             prefill_kv_computed = finished_request.num_prompt_tokens - max(
                 finished_request.num_cached_tokens, 0
             )
-            self.histogram_prefill_kv_computed_request[engine_idx].observe(
-                prefill_kv_computed
-            )
+            if not finished_request.never_started:
+                self.histogram_prefill_kv_computed_request[engine_idx].observe(
+                    prefill_kv_computed
+                )
             self.histogram_num_prompt_tokens_request[engine_idx].observe(
                 finished_request.num_prompt_tokens
             )
             self.histogram_num_generation_tokens_request[engine_idx].observe(
                 finished_request.num_generation_tokens
             )
-            self.histogram_request_time_per_output_token[engine_idx].observe(
-                finished_request.mean_time_per_output_token
-            )
+            if not finished_request.never_started:
+                self.histogram_request_time_per_output_token[engine_idx].observe(
+                    finished_request.mean_time_per_output_token
+                )
             if finished_request.max_tokens_param:
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param

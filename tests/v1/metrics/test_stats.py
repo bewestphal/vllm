@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.stats import (
     IterationStats,
+    LoRARequestStates,
     PrefillStats,
     PrefixCacheStats,
     PromptTokenStats,
@@ -20,6 +26,63 @@ from vllm.v1.utils import compute_iteration_details
 def test_iteration_stats_repr():
     iteration_stats = IterationStats()
     assert repr(iteration_stats).startswith("IterationStats(")
+
+
+@pytest.mark.skip_global_cleanup
+def test_never_started_error_has_queue_time_without_execution_latencies():
+    stats = IterationStats()
+    req_stats = RequestStateStats(arrival_time=stats.iteration_timestamp - 2.0)
+    req_stats.queued_ts = 100.0
+    stats.update_from_output(
+        EngineCoreOutput(
+            request_id="expired", new_token_ids=[], finish_reason=FinishReason.ERROR
+        ),
+        engine_core_timestamp=102.0,
+        is_prefilling=True,
+        req_stats=req_stats,
+        lora_states=LoRARequestStates(),
+        lora_name=None,
+    )
+    assert stats.time_to_first_tokens_iter == []
+    with patch("vllm.v1.metrics.stats.time.monotonic", return_value=102.0):
+        stats.update_from_finished_request(
+            FinishReason.ERROR, "expired", 10, 16, req_stats
+        )
+    (finished,) = stats.finished_requests
+    assert finished.never_started
+    assert finished.queued_time == 2.0
+    assert finished.prefill_time == 0.0
+    assert finished.decode_time == 0.0
+    assert finished.inference_time == 0.0
+    assert finished.num_generation_tokens == 0
+    logger = MagicMock()
+    PrometheusStatLogger.record(logger, None, stats)
+    logger.histogram_queue_time_request[0].observe.assert_called_once_with(2.0)
+    logger.histogram_prefill_time_request[0].observe.assert_not_called()
+    logger.histogram_inference_time_request[0].observe.assert_not_called()
+    logger.histogram_decode_time_request[0].observe.assert_not_called()
+    logger.histogram_time_to_first_token[0].observe.assert_not_called()
+    logger.histogram_prefill_kv_computed_request[0].observe.assert_not_called()
+    logger.histogram_num_prompt_tokens_request[0].observe.assert_called_once_with(10)
+    logger.histogram_num_generation_tokens_request[0].observe.assert_called_once_with(0)
+
+
+@pytest.mark.skip_global_cleanup
+def test_zero_token_success_preserves_prefill_latency():
+    """Successful pooling outputs still record their first-result latency."""
+    stats = IterationStats()
+    req_stats = RequestStateStats(arrival_time=stats.iteration_timestamp - 2.0)
+    stats.update_from_output(
+        EngineCoreOutput(
+            request_id="pooling", new_token_ids=[], finish_reason=FinishReason.STOP
+        ),
+        engine_core_timestamp=102.0,
+        is_prefilling=True,
+        req_stats=req_stats,
+        lora_states=LoRARequestStates(),
+        lora_name=None,
+    )
+    assert stats.time_to_first_tokens_iter == [2.0]
 
 
 def test_scheduler_iteration_details_serialization():

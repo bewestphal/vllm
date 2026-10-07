@@ -49,6 +49,11 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.queue_deadline_scheduler import (
+    QUEUE_TIMEOUT_STOP_REASON,
+    AsyncQueueDeadlineScheduler,
+    QueueDeadlineScheduler,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -63,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
     ECConnectorOutput,
     KVConnectorOutput,
@@ -145,6 +151,147 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+@pytest.mark.skip_global_cleanup
+def test_queue_deadline_expires_before_execution(monkeypatch, async_scheduling, policy):
+    """Expiry emits one terminal output even when no model tokens are scheduled."""
+    monkeypatch.setenv("VLLM_MAX_QUEUE_AGE_SECONDS", "2")
+    cls = AsyncQueueDeadlineScheduler if async_scheduling else QueueDeadlineScheduler
+    scheduler = create_scheduler(
+        scheduler_cls=cls,
+        async_scheduling=async_scheduling,
+        scheduling_policy=policy,
+    )
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.queue_deadline_scheduler.time.monotonic", clock
+    )
+    (request,) = create_requests(num_requests=1)
+    request.client_index = 3
+    scheduler.add_request(request)
+    clock.return_value = 102.0
+    scheduled = scheduler.schedule()
+    assert scheduled.total_num_scheduled_tokens == 0
+    assert request.request_id not in scheduler.requests
+    assert scheduler.get_num_unfinished_requests() == 0
+    outputs = scheduler.update_from_output(scheduled, EMPTY_MODEL_RUNNER_OUTPUT)
+    (output,) = outputs[3].outputs
+    assert output.request_id == request.request_id
+    assert output.finish_reason == FinishReason.ERROR
+    assert output.stop_reason == QUEUE_TIMEOUT_STOP_REASON
+    assert output.new_token_ids == []
+    assert output.events
+    outputs = scheduler.update_from_output(
+        scheduler.schedule(), EMPTY_MODEL_RUNNER_OUTPUT
+    )
+    assert all(not group.outputs for group in outputs.values())
+
+
+@pytest.mark.parametrize("limit,age", [("0", 1000.0), ("2", 1.999)])
+@pytest.mark.skip_global_cleanup
+def test_queue_deadline_allows_unexpired_requests(monkeypatch, limit, age):
+    monkeypatch.setenv("VLLM_MAX_QUEUE_AGE_SECONDS", limit)
+    scheduler = create_scheduler(scheduler_cls=QueueDeadlineScheduler)
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.queue_deadline_scheduler.time.monotonic", clock
+    )
+    (request,) = create_requests(num_requests=1)
+    scheduler.add_request(request)
+    clock.return_value += age
+    scheduled = scheduler.schedule()
+    assert request.request_id in scheduled.num_scheduled_tokens
+    assert request.status == RequestStatus.RUNNING
+    assert not scheduler._queued_at
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.skip_global_cleanup
+def test_queue_deadline_preserves_running_requests(monkeypatch, async_scheduling):
+    monkeypatch.setenv("VLLM_MAX_QUEUE_AGE_SECONDS", "2")
+    cls = AsyncQueueDeadlineScheduler if async_scheduling else QueueDeadlineScheduler
+    scheduler = create_scheduler(
+        max_num_seqs=1, scheduler_cls=cls, async_scheduling=async_scheduling
+    )
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.queue_deadline_scheduler.time.monotonic", clock
+    )
+    running, waiting = create_requests(num_requests=2)
+    scheduler.add_request(running)
+    scheduled = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[running.request_id],
+            req_id_to_index={running.request_id: 0},
+            sampled_token_ids=[[0]],
+        ),
+    )
+    scheduler.add_request(waiting)
+    clock.return_value = 102.0
+    scheduled = scheduler.schedule()
+    assert running.request_id in scheduled.num_scheduled_tokens
+    assert running.status == RequestStatus.RUNNING
+    assert waiting.status == RequestStatus.FINISHED_ERROR
+
+
+@pytest.mark.skip_global_cleanup
+def test_queue_deadline_preserves_preempted_requests(monkeypatch):
+    monkeypatch.setenv("VLLM_MAX_QUEUE_AGE_SECONDS", "2")
+    scheduler = create_scheduler(scheduler_cls=QueueDeadlineScheduler)
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.queue_deadline_scheduler.time.monotonic", clock
+    )
+    (request,) = create_requests(num_requests=1)
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[0]],
+        ),
+    )
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 100.0)
+    clock.return_value = 200.0
+    scheduled = scheduler.schedule()
+    assert request.request_id in scheduled.num_scheduled_tokens
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_preemptions == 1
+
+
+@pytest.mark.skip_global_cleanup
+def test_queue_deadline_does_not_emit_error_for_aborted_requests(monkeypatch):
+    monkeypatch.setenv("VLLM_MAX_QUEUE_AGE_SECONDS", "2")
+    scheduler = create_scheduler(scheduler_cls=QueueDeadlineScheduler)
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.queue_deadline_scheduler.time.monotonic", clock
+    )
+    (request,) = create_requests(num_requests=1)
+    scheduler.add_request(request)
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    clock.return_value = 102.0
+    outputs = scheduler.update_from_output(
+        scheduler.schedule(), EMPTY_MODEL_RUNNER_OUTPUT
+    )
+    assert all(not group.outputs for group in outputs.values())
+    assert not scheduler._queued_at
+
+
+@pytest.mark.parametrize("limit", ["-1", "nan", "inf", "invalid"])
+@pytest.mark.skip_global_cleanup
+def test_queue_deadline_rejects_invalid_limit(monkeypatch, limit):
+    monkeypatch.setenv("VLLM_MAX_QUEUE_AGE_SECONDS", limit)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        create_scheduler(scheduler_cls=QueueDeadlineScheduler)
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2])
