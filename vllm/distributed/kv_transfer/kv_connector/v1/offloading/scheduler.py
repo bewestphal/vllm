@@ -366,6 +366,8 @@ class RequestOffloadState:
     max_load_tokens: int | None = None
     # upper bound on tokens to offload for this request; None means no cap
     max_offload_tokens: int | None = None
+    # Full-attention blocks retained past the reconciled local GPU hit.
+    gpu_prefix_tokens: dict[int, int] = field(default_factory=dict)
     # number of hits in the GPU cache
     num_locally_computed_tokens: int = 0
     # In-flight job IDs. Per the connector's invariant, at any given time
@@ -776,7 +778,12 @@ class OffloadingConnectorScheduler:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
-            max_hit_size_tokens -= 1
+            if req_status.gpu_prefix_tokens:
+                max_hit_size_tokens = min(
+                    max_hit_size_tokens, req_status.req.num_tokens - 1
+                )
+            else:
+                max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
                 max_hit_size_tokens = round_down(
@@ -826,6 +833,11 @@ class OffloadingConnectorScheduler:
                 sliding_window_size_in_chunks = (
                     group_config.sliding_window_size_in_chunks
                 )
+                gpu_prefix_tokens = (
+                    req_status.gpu_prefix_tokens.get(group_config.group_idx, 0)
+                    if isinstance(group_config.kv_cache_spec, FullAttentionSpec)
+                    else 0
+                )
 
                 # For eagle groups, query one extra chunk that will be popped.
                 # Widening applies to every group type: without it, the pop
@@ -842,19 +854,26 @@ class OffloadingConnectorScheduler:
 
                 num_chunks = min(cdiv(query_max, tokens_per_chunk), len(offload_keys))
                 start_chunk_idx = num_computed_tokens // tokens_per_chunk
+                if gpu_prefix_tokens:
+                    start_chunk_idx = max(
+                        start_chunk_idx, gpu_prefix_tokens // tokens_per_chunk
+                    )
                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
 
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
                 if sliding_window_size_in_chunks is None:
-                    num_hit_chunks = self._maximal_prefix_lookup(
-                        offload_keys,
-                        req_status.req_context,
-                        req_status.req,
-                        group_config,
-                        start_chunk_idx,
-                    )
+                    if gpu_prefix_tokens >= max_hit_size_tokens:
+                        num_hit_chunks = 0
+                    else:
+                        num_hit_chunks = self._maximal_prefix_lookup(
+                            offload_keys,
+                            req_status.req_context,
+                            req_status.req,
+                            group_config,
+                            start_chunk_idx,
+                        )
                 else:
                     required_window = sliding_window_size_in_chunks
                     if is_eagle_unverified:
@@ -873,13 +892,13 @@ class OffloadingConnectorScheduler:
                         req_status.req_context,
                         initial_window + int(is_eagle_unverified),
                     )
-                if num_hit_chunks == 0:
+                if num_hit_chunks == 0 and gpu_prefix_tokens <= num_computed_tokens:
                     return 0
 
                 if num_hit_chunks is None:
                     defer_lookup = True
                 else:
-                    if is_eagle_unverified:
+                    if is_eagle_unverified and num_hit_chunks > 0:
                         num_hit_chunks -= 1
                         eagle_verified.add(group_idx)
 
@@ -930,6 +949,12 @@ class OffloadingConnectorScheduler:
                     num_computed_tokens + num_hit_tokens, tokens_per_chunk
                 )
                 start_chunk_idx = num_computed_tokens // tokens_per_chunk
+                if isinstance(group_config.kv_cache_spec, FullAttentionSpec):
+                    start_chunk_idx = max(
+                        start_chunk_idx,
+                        req_status.gpu_prefix_tokens.get(group_config.group_idx, 0)
+                        // tokens_per_chunk,
+                    )
                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
                 if sliding_window_size_in_chunks is not None:
                     offload_keys = offload_keys[-sliding_window_size_in_chunks:]
@@ -1041,6 +1066,7 @@ class OffloadingConnectorScheduler:
         request: Request,
         num_computed_tokens: int,
         max_num_new_tokens: int | None = None,
+        gpu_prefix_tokens: dict[int, int] | None = None,
     ) -> tuple[int | None, bool]:
         """Get number of new tokens that can be loaded beyond the
         num_computed_tokens.
@@ -1051,6 +1077,8 @@ class OffloadingConnectorScheduler:
                 computed tokens for this request
             max_num_new_tokens (int | None): cap on the number of tokens that
                 may be loaded beyond `num_computed_tokens`, if any.
+            gpu_prefix_tokens (dict[int, int] | None): complete full-attention
+                prefixes retained on GPU, keyed by cache group ID.
 
         Returns:
             A tuple with the following elements:
@@ -1064,6 +1092,7 @@ class OffloadingConnectorScheduler:
 
         """
         req_status = self._req_status[request.request_id]
+        req_status.gpu_prefix_tokens = gpu_prefix_tokens or {}
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 

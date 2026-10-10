@@ -948,13 +948,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if not isinstance(group.spec, FullAttentionSpec):
                 continue
             manager = self.single_type_managers[group.group_ids[0]]
-            if manager.retains_longer_hit:
+            if manager.retains_longer_hit and not manager.retains_complete_hit:
                 continue
             group_block_size = manager.block_size
             num_blocks = cdiv(hit_length, group_block_size)
             for group_id in group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
-                    del blks[num_blocks:]
+                    retained_blocks = num_blocks
+                    if manager.retains_longer_hit:
+                        retained_blocks = max(
+                            retained_blocks,
+                            hit_length_by_group[group_id] // group_block_size,
+                        )
+                    del blks[retained_blocks:]
                     hit_length_by_group[group_id] = hit_length
 
         # Uncached shared prefix detection: if any attn. group cached a longer

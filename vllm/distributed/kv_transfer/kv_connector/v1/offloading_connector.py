@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -43,14 +43,19 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+    _gpu_prefix_group_ids: tuple[int, ...] = ()
+
     @cached_property
     def _bounding_group_ids(self) -> tuple[int, ...]:
         """Prefix-cacheable groups this connector does not offload.
@@ -151,14 +156,86 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        """Retain complete GPU attention prefixes for per-group CPU lookup."""
+        super().bind_kv_cache_manager(kv_cache_manager)
+        coordinator = kv_cache_manager.coordinator
+        if (
+            self.connector_scheduler is None
+            or not kv_cache_manager.enable_caching
+            or not isinstance(coordinator, HybridKVCacheCoordinator)
+        ):
+            return
+
+        config = self.scheduler.config
+        groups = config.kv_group_configs
+        if (
+            config.blocks_per_chunk != 1
+            or {group.group_idx for group in groups}
+            != set(kv_cache_manager.kv_cache_config.prefix_cacheable_group_ids)
+            or len({group.tokens_per_block for group in groups}) != 1
+            or not any(
+                isinstance(group.kv_cache_spec, FullAttentionSpec) for group in groups
+            )
+            or not any(isinstance(group.kv_cache_spec, MambaSpec) for group in groups)
+            or any(
+                not isinstance(group.kv_cache_spec, (FullAttentionSpec, MambaSpec))
+                or (
+                    isinstance(group.kv_cache_spec, MambaSpec)
+                    and group.kv_cache_spec.mamba_cache_mode != "align"
+                )
+                or coordinator.single_type_managers[group.group_idx].block_size
+                != group.tokens_per_block
+                for group in groups
+            )
+        ):
+            return
+
+        self._gpu_prefix_group_ids = tuple(
+            group.group_idx
+            for group in groups
+            if isinstance(group.kv_cache_spec, FullAttentionSpec)
+        )
+        for group_id in self._gpu_prefix_group_ids:
+            manager = coordinator.single_type_managers[group_id]
+            manager.retains_longer_hit = True
+            manager.retains_complete_hit = True
+        kv_cache_manager.retained_hit_group_ids = tuple(
+            dict.fromkeys(
+                (*kv_cache_manager.retained_hit_group_ids, *self._gpu_prefix_group_ids)
+            )
+        )
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
+        gpu_prefix_tokens = None
+        if self._gpu_prefix_group_ids and not request.skip_reading_prefix_cache:
+            assert self._kv_cache_manager is not None
+            coordinator = self._kv_cache_manager.coordinator
+            assert isinstance(coordinator, HybridKVCacheCoordinator)
+            _, shared_gpu_hit, _ = coordinator.find_longest_cache_hit(
+                request.block_hashes, request.num_tokens - 1
+            )
+            if shared_gpu_hit == num_computed_tokens:
+                _, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+                    request.block_hashes, request.num_tokens - 1
+                )
+                gpu_prefix_tokens = {
+                    group.group_idx: (
+                        per_group_hits[group.group_idx]
+                        // group.tokens_per_chunk
+                        * group.tokens_per_chunk
+                    )
+                    for group in self.scheduler.config.kv_group_configs
+                    if group.group_idx in self._gpu_prefix_group_ids
+                }
         return self.connector_scheduler.get_num_new_matched_tokens(
             request,
             num_computed_tokens,
             max_num_new_tokens=self._max_loadable_tokens(request, num_computed_tokens),
+            gpu_prefix_tokens=gpu_prefix_tokens,
         )
 
     def _max_loadable_tokens(

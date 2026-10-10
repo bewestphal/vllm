@@ -12,6 +12,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -6848,6 +6849,7 @@ def _create_hybrid_mamba_connector_scheduler(
         skip_tokenizer_init=True,
     )
     vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
             max_num_batched_tokens=8192,
@@ -7044,6 +7046,186 @@ def test_hybrid_fa_deeper_hit_respects_connector_lookup_policy(
     output = scheduler.schedule()
     [new_req] = output.scheduled_new_reqs
     assert new_req.num_computed_tokens == expected_num_computed
+
+
+def _retain_native_hybrid_attention_hits(manager: KVCacheManager) -> None:
+    """Enable the complete attention retention used by native hybrid offload."""
+    attention_manager = manager.coordinator.single_type_managers[0]
+    attention_manager.retains_longer_hit = True
+    attention_manager.retains_complete_hit = True
+    manager.retained_hit_group_ids = tuple(
+        sorted(set(manager.retained_hit_group_ids) | {0})
+    )
+
+
+@pytest.mark.parametrize("external_tokens", [0, 48])
+def test_native_hybrid_attention_retention_requires_external_state(
+    external_tokens: int,
+):
+    """Retain GPU attention only up to the prefix backed by recurrent state."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(
+        external_tokens, supports_divergent_hits=False
+    )
+    manager = scheduler.kv_cache_manager
+    fa_ids, mamba_ids = _seed_hybrid_prefix(manager, 4, block_size)
+    manager.new_step_starts()
+    manager.block_pool.evict_blocks(set(mamba_ids[1:]))
+    _retain_native_hybrid_attention_hits(manager)
+
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=4 * block_size + 1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["native-replay"],
+    )
+    computed, local_tokens, _ = manager.get_computed_blocks(replay)
+    assert local_tokens == block_size
+    assert computed.get_block_ids()[0] == fa_ids
+
+    allocated = manager.allocate_slots(
+        replay,
+        0,
+        num_new_computed_tokens=local_tokens,
+        new_computed_blocks=computed,
+        num_external_computed_tokens=external_tokens,
+        delay_cache_blocks=True,
+    )
+    assert allocated is not None
+    fa_blocks, mamba_blocks = manager.get_blocks(replay.request_id).blocks
+    retained_blocks = (local_tokens + external_tokens) // block_size
+    assert [block.block_id for block in fa_blocks] == fa_ids[:retained_blocks]
+    assert allocated.get_block_ids()[0] == []
+    assert all(block.ref_cnt == 1 for block in fa_blocks)
+    assert all(
+        manager.block_pool.blocks[block_id].ref_cnt == 0
+        for block_id in fa_ids[retained_blocks:]
+    )
+    if external_tokens:
+        assert all(block.is_null for block in mamba_blocks[:-1])
+        assert not mamba_blocks[-1].is_null
+        assert mamba_blocks[-1].block_hash is None
+        assert allocated.get_block_ids()[1] == []
+    else:
+        assert [block.block_id for block in mamba_blocks] == [mamba_ids[0]]
+        assert allocated.get_block_ids()[1] == []
+
+
+def test_native_hybrid_retained_attention_waits_for_recurrent_restore():
+    """A represented CPU state restore must finish before prefill can run."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(
+        3 * block_size, supports_divergent_hits=False
+    )
+    assert scheduler.connector is not None
+    scheduler.connector.config = dataclasses.replace(
+        scheduler.connector.config, is_async=True
+    )
+    manager = scheduler.kv_cache_manager
+    fa_ids, mamba_ids = _seed_hybrid_prefix(manager, 4, block_size)
+    manager.block_pool.evict_blocks(set(mamba_ids[1:]))
+    _retain_native_hybrid_attention_hits(manager)
+    [replay] = create_requests(
+        num_requests=1,
+        num_tokens=4 * block_size + 1,
+        same_prompt=True,
+        block_size=block_size,
+        req_ids=["native-async-replay"],
+    )
+    scheduler.add_request(replay)
+
+    loading = scheduler.schedule()
+    assert replay.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert replay.num_computed_tokens == 4 * block_size
+    assert not loading.scheduled_new_reqs
+    assert not loading.num_scheduled_tokens
+    assert manager.get_block_ids(replay.request_id)[0] == fa_ids
+    assert manager.get_blocks(replay.request_id).blocks[1][-1].block_hash is None
+
+    empty_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(loading, empty_output)
+    pending = scheduler.schedule()
+    assert replay.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not pending.num_scheduled_tokens
+
+    scheduler.update_from_output(
+        pending,
+        dataclasses.replace(
+            empty_output,
+            kv_connector_output=KVConnectorOutput(finished_recving={replay.request_id}),
+        ),
+    )
+    ready = scheduler.schedule()
+    assert replay.status == RequestStatus.RUNNING
+    [scheduled] = ready.scheduled_new_reqs
+    assert scheduled.num_computed_tokens == 4 * block_size
+    assert ready.num_scheduled_tokens == {replay.request_id: 1}
+    assert manager.get_block_ids(replay.request_id)[0][:4] == fa_ids
+
+
+def test_native_hybrid_attention_retention_excludes_partial_gpu_tail():
+    """A partial GPU attention block must be replaced before CPU fills its tail."""
+    from tests.v1.core.prefix_cache.test_partial_prefix_cache_hits import (
+        make_full_mamba_manager,
+    )
+    from tests.v1.core.test_prefix_caching import make_request
+
+    block_size = 16
+    hash_block_size = 4
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=block_size,
+        mamba_block_size=block_size,
+        num_blocks=100,
+    )
+    init_none_hash(sha256)
+    fill = make_request("partial-fill", list(range(68)), hash_block_size, sha256)
+    computed, local_tokens, _ = manager.get_computed_blocks(fill)
+    assert local_tokens == 0
+    mamba_ids = []
+    for index, num_tokens in enumerate([16, 16, 16, 16, 4]):
+        manager.allocate_slots(
+            fill, num_tokens, new_computed_blocks=computed if index == 0 else None
+        )
+        fill.num_computed_tokens += num_tokens
+        fa_ids, group_mamba_ids = manager.get_block_ids(fill.request_id)
+        mamba_ids.append(group_mamba_ids[index])
+    manager.free(fill)
+    manager.new_step_starts()
+    partial_fa_id = fa_ids[-1]
+    assert manager.block_pool.blocks[partial_fa_id].block_hash_num_tokens == 68
+    manager.block_pool.evict_blocks(set(mamba_ids[1:]))
+    _retain_native_hybrid_attention_hits(manager)
+
+    replay = make_request("partial-replay", list(range(81)), hash_block_size, sha256)
+    computed, local_tokens, _ = manager.get_computed_blocks(replay)
+    assert local_tokens == block_size
+    assert computed.get_block_ids()[0] == fa_ids[:4]
+    allocated = manager.allocate_slots(
+        replay,
+        0,
+        num_new_computed_tokens=local_tokens,
+        new_computed_blocks=computed,
+        num_external_computed_tokens=4 * block_size,
+        delay_cache_blocks=True,
+    )
+    assert allocated is not None
+    adopted_fa = manager.get_blocks(replay.request_id).blocks[0]
+    assert [block.block_id for block in adopted_fa[:4]] == fa_ids[:4]
+    assert len(adopted_fa) == 5
+    assert adopted_fa[-1].block_id != partial_fa_id
+    assert adopted_fa[-1].block_hash is None
+    assert allocated.get_block_ids()[0] == []
+    assert manager.block_pool.blocks[partial_fa_id].ref_cnt == 0
 
 
 def _make_encoder_instance_request(scheduler, text_prefix=8, image_tokens=16):

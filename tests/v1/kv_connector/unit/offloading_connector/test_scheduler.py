@@ -50,6 +50,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
+    MambaManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
@@ -4822,7 +4823,9 @@ class TestMambaHybridOffloadServing:
     MAMBA_BLOCK = 16
     PROMPT_TOKENS = 28  # 7 hash blocks; 1 full mamba chunk
 
-    def _make_scheduler(self, speculative_config, mamba_eagle=False):
+    def _make_scheduler(
+        self, speculative_config, mamba_eagle=False, attention_block_size=None
+    ):
         vllm_config = _make_vllm_config(
             extra_config={"self_describing_kv_events": True}
         )
@@ -4839,7 +4842,7 @@ class TestMambaHybridOffloadServing:
                 KVCacheGroupSpec(
                     ["full_layer"],
                     FullAttentionSpec(
-                        block_size=self.BLOCK,
+                        block_size=attention_block_size or self.BLOCK,
                         num_kv_heads=1,
                         head_size=1,
                         dtype=torch.float32,
@@ -4965,3 +4968,216 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+    def _make_mixed_tier_request(
+        self,
+        scheduler,
+        *,
+        cpu_attention_start=None,
+        checkpoints=(64,),
+        state_result=LookupResult.HIT,
+        max_load_tokens=None,
+    ):
+        request = MagicMock()
+        request.request_id = "mixed-tier"
+        request.kv_transfer_params = (
+            {"max_load_tokens": max_load_tokens}
+            if max_load_tokens is not None
+            else None
+        )
+        request.kv_hints = None
+        request.num_tokens = request.num_prompt_tokens = 65
+        request.num_computed_tokens = 0
+        request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(16)]
+        request.all_token_ids = list(range(65))
+        request.lora_request = None
+        request.skip_reading_prefix_cache = False
+        request.is_finished.return_value = False
+        scheduler.on_new_request(request)
+        state = scheduler._req_status[request.request_id]
+        state.update_offload_keys()
+        ready = {}
+        for group_config, group_state in zip(
+            scheduler.config.kv_group_configs, state.group_states
+        ):
+            for i, key in enumerate(group_state.offload_keys):
+                boundary = (i + 1) * group_config.tokens_per_chunk
+                if group_config.group_idx == 0:
+                    if (
+                        cpu_attention_start is not None
+                        and boundary > cpu_attention_start
+                    ):
+                        ready[key] = LookupResult.HIT
+                elif boundary in checkpoints:
+                    ready[key] = state_result
+        scheduler.manager.lookup.side_effect = lambda key, ctx: ready.get(
+            key, LookupResult.MISS
+        )
+        return request, state
+
+    @pytest.mark.parametrize("attention_block_size", [4, 16])
+    def test_gpu_attention_accepts_cpu_only_recurrent_checkpoint(
+        self, attention_block_size
+    ):
+        """A resident attention prefix needs no duplicate CPU attention copy."""
+        scheduler = self._make_scheduler(
+            None, attention_block_size=attention_block_size
+        )
+        request, _ = self._make_mixed_tier_request(scheduler)
+
+        assert scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 64}
+        ) == (48, True)
+        assert all(
+            get_offload_group_idx(call.args[0]) == 1
+            for call in scheduler.manager.lookup.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        "state_result,expected",
+        [
+            (LookupResult.MISS, (0, False)),
+            (LookupResult.HIT_PENDING, (None, False)),
+            (LookupResult.RETRY, (None, False)),
+        ],
+    )
+    def test_gpu_attention_cannot_bypass_unavailable_recurrent_state(
+        self, state_result, expected
+    ):
+        scheduler = self._make_scheduler(None)
+        request, _ = self._make_mixed_tier_request(scheduler, state_result=state_result)
+        assert (
+            scheduler.get_num_new_matched_tokens(request, 16, gpu_prefix_tokens={0: 64})
+            == expected
+        )
+
+    def test_gpu_attention_and_cpu_attention_suffix_extend_together(self):
+        scheduler = self._make_scheduler(None)
+        request, _ = self._make_mixed_tier_request(scheduler, cpu_attention_start=32)
+        assert scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 32}
+        ) == (48, True)
+        attention_keys = {
+            call.args[0]
+            for call in scheduler.manager.lookup.call_args_list
+            if get_offload_group_idx(call.args[0]) == 0
+        }
+        state = scheduler._req_status[request.request_id]
+        assert attention_keys == set(state.group_states[0].offload_keys[8:16])
+
+    def test_gpu_attention_remains_usable_when_cpu_attention_suffix_is_missing(self):
+        scheduler = self._make_scheduler(None)
+        request, _ = self._make_mixed_tier_request(scheduler, checkpoints=(32, 64))
+        assert scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 32}
+        ) == (16, True)
+
+    @pytest.mark.parametrize("cap_source", ["scheduler", "request"])
+    @pytest.mark.parametrize("cap,expected", [(0, 0), (16, 16), (32, 32)])
+    def test_mixed_tier_restore_respects_load_cap(self, cap_source, cap, expected):
+        scheduler = self._make_scheduler(None)
+        request, _ = self._make_mixed_tier_request(
+            scheduler,
+            checkpoints=(32, 48, 64),
+            max_load_tokens=cap if cap_source == "request" else None,
+        )
+        assert scheduler.get_num_new_matched_tokens(
+            request,
+            16,
+            max_num_new_tokens=cap if cap_source == "scheduler" else None,
+            gpu_prefix_tokens={0: 64},
+        ) == (expected, bool(expected))
+
+    def test_mixed_tier_restore_requires_prefix_cache_reading(self):
+        scheduler = self._make_scheduler(None)
+        request, _ = self._make_mixed_tier_request(scheduler)
+        request.skip_reading_prefix_cache = True
+        assert scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 64}
+        ) == (0, False)
+        scheduler.manager.lookup.assert_not_called()
+
+    def test_cpu_only_recurrent_state_requires_an_attention_prefix(self):
+        scheduler = self._make_scheduler(None)
+        request, _ = self._make_mixed_tier_request(scheduler)
+        assert scheduler.get_num_new_matched_tokens(request, 16) == (0, False)
+
+    def test_gpu_attention_eagle_boundary_is_not_dropped_twice(self):
+        scheduler = self._make_scheduler(None, mamba_eagle=True)
+        request, _ = self._make_mixed_tier_request(scheduler)
+        assert scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 64}
+        ) == (48, True)
+
+    @pytest.mark.parametrize("loading_group", [0, 1])
+    def test_mixed_tier_restore_waits_only_for_cpu_dependent_keys(self, loading_group):
+        scheduler = self._make_scheduler(None)
+        request, state = self._make_mixed_tier_request(scheduler)
+        assert scheduler._chunks_being_loaded is not None
+        scheduler._chunks_being_loaded.add(
+            state.group_states[loading_group].offload_keys[-1]
+        )
+        expected = (48, True) if loading_group == 0 else (None, False)
+        assert (
+            scheduler.get_num_new_matched_tokens(request, 16, gpu_prefix_tokens={0: 64})
+            == expected
+        )
+
+    def test_mixed_tier_restore_loads_only_missing_state_and_waits_for_completion(self):
+        """The asynchronous load must never overwrite resident attention."""
+        scheduler = self._make_scheduler(None, attention_block_size=16)
+        request, state = self._make_mixed_tier_request(scheduler)
+        external, load_async = scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 64}
+        )
+        assert external == 48 and load_async
+
+        pool = BlockPool(64, enable_caching=True, hash_block_size=4)
+        managers = []
+        cached_attention = pool.get_new_blocks(4)
+        for i, block in enumerate(cached_attention):
+            block.set_block_hash(
+                make_block_hash_with_group_id(request.block_hashes[4 * i + 3], 0)
+            )
+        for i, group_config in enumerate(scheduler.config.kv_group_configs):
+            manager_cls = FullAttentionManager if i == 0 else MambaManager
+            manager = manager_cls(
+                kv_cache_spec=group_config.kv_cache_spec,
+                block_pool=pool,
+                enable_caching=True,
+                kv_cache_group_id=i,
+                scheduler_block_size=16,
+            )
+            manager.add_local_computed_blocks(
+                request.request_id, cached_attention if i == 0 else [], 16, external
+            )
+            managers.append(manager)
+        for manager in managers:
+            manager.allocate_external_computed_blocks(request.request_id, 16, external)
+        blocks = KVCacheBlocks(
+            tuple(manager.req_to_blocks[request.request_id] for manager in managers)
+        )
+        scheduler.update_state_after_alloc(request, blocks, external)
+
+        assert len(scheduler._current_batch_load_jobs) == 1
+        job_id, job = next(iter(scheduler._current_batch_load_jobs.items()))
+        assert job.dst_spec.group_sizes == [0, 1]
+        assert job.dst_spec.block_ids.tolist() == [blocks.blocks[1][3].block_id]
+        assert job.src_spec.offload_keys == [state.group_states[1].offload_keys[3]]
+        assert scheduler.get_num_new_matched_tokens(
+            request, 16, gpu_prefix_tokens={0: 64}
+        ) == (None, False)
+        scheduler.manager.complete_load.assert_not_called()
+
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs={job_id: 1}
+                )
+            )
+        )
+        assert not state.transfer_jobs
+        scheduler.manager.complete_load.assert_called_once_with(
+            {state.group_states[1].offload_keys[3]}, state.req_context
+        )
+        assert list(blocks.blocks[0]) == cached_attention

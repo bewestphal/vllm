@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for translating vLLM cache metadata to native offloading config."""
 
+from dataclasses import replace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -16,7 +17,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     kv_cache_groups_tp_replicas,
@@ -552,6 +557,135 @@ def test_offloading_skips_scratch_group():
     assert [group.group_id for group in offloading_config.groups] == [0, 2]
     assert [group.group_idx for group in scheduler_config.kv_group_configs] == [0, 2]
     assert offloading_config.worker_kv_bytes_per_block == page_size
+
+
+def _make_native_hybrid_binding(case: str = "eligible"):
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    if case == "different-group-sizes":
+        kv_cache_config.kv_cache_groups[1].kv_cache_spec = replace(
+            _mamba_spec(), block_size=32
+        )
+    elif case == "non-align":
+        kv_cache_config.kv_cache_groups[1].kv_cache_spec = replace(
+            _mamba_spec(), mamba_cache_mode="all"
+        )
+    elif case == "scratch":
+        kv_cache_config.kv_cache_groups.insert(
+            1,
+            KVCacheGroupSpec(
+                ["scratch"],
+                CircularBufferSpec(
+                    block_size=4, num_kv_heads=1, head_size=128, dtype=torch.float32
+                ),
+            ),
+        )
+
+    config = _make_vllm_config(
+        extra_config={"block_size": 32} if case == "chunk-two" else None
+    )
+    config.speculative_config = None
+    config.cache_config.prefix_match_unit = 4
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(build_offloading_config(config, kv_cache_config)),
+        config,
+        kv_cache_config,
+    )
+    if case == "effective-size-mismatch":
+        scheduler_config = scheduler_config._replace(
+            kv_group_configs=tuple(
+                group._replace(tokens_per_block=32, tokens_per_chunk=32)
+                for group in scheduler_config.kv_group_configs
+            )
+        )
+
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=128,
+        scheduler_block_size=max(
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if group.kv_cache_spec.prefix_cacheable
+        ),
+        hash_block_size=4,
+        enable_caching=case != "no-cache",
+    )
+    connector = OffloadingConnector.__new__(OffloadingConnector)
+    connector._kv_cache_config = kv_cache_config
+    connector.connector_scheduler = MagicMock(config=scheduler_config)
+    return connector, manager
+
+
+@pytest.mark.parametrize("case", ["eligible", "scratch"])
+def test_native_hybrid_binding_retains_attention_with_fine_grained_hashes(case):
+    """Scratch groups do not prevent retaining complete GPU attention hits."""
+    connector, manager = _make_native_hybrid_binding(case)
+    assert manager.coordinator.enable_partial_hash_hits
+    mamba_group_id = len(manager.kv_cache_config.kv_cache_groups) - 1
+    manager.coordinator.single_type_managers[mamba_group_id].retains_longer_hit = True
+    manager.retained_hit_group_ids = (mamba_group_id,)
+
+    connector.bind_kv_cache_manager(manager)
+
+    attention = manager.coordinator.single_type_managers[0]
+    assert attention.retains_longer_hit and attention.retains_complete_hit
+    assert manager.retained_hit_group_ids == (mamba_group_id, 0)
+    assert connector._gpu_prefix_group_ids == (0,)
+    if case == "scratch":
+        assert not manager.coordinator.single_type_managers[1].retains_longer_hit
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "chunk-two",
+        "different-group-sizes",
+        "effective-size-mismatch",
+        "non-align",
+        "no-cache",
+    ],
+)
+def test_native_hybrid_binding_keeps_unsupported_layouts_unchanged(case):
+    connector, manager = _make_native_hybrid_binding(case)
+
+    connector.bind_kv_cache_manager(manager)
+
+    assert manager.retained_hit_group_ids == ()
+    assert connector._gpu_prefix_group_ids == ()
+    assert not manager.coordinator.single_type_managers[0].retains_longer_hit
+
+
+@pytest.mark.parametrize(
+    ("shared_gpu_hit", "skip_reading", "expected_gpu_prefix"),
+    [(16, False, {0: 64}), (20, False, None), (16, True, None)],
+)
+def test_native_hybrid_lookup_only_advertises_complete_gpu_attention(
+    shared_gpu_hit, skip_reading, expected_gpu_prefix
+):
+    """Rounded partial local hits and cache bypass use ordinary CPU lookup."""
+    connector, manager = _make_native_hybrid_binding()
+    connector.bind_kv_cache_manager(manager)
+    request = MagicMock()
+    request.num_tokens = 81
+    request.block_hashes = []
+    request.skip_reading_prefix_cache = skip_reading
+    connector.scheduler.get_num_new_matched_tokens.return_value = (48, True)
+    with (
+        patch.object(
+            manager.coordinator,
+            "find_longest_cache_hit",
+            return_value=(([], []), shared_gpu_hit, 0),
+        ),
+        patch.object(
+            manager.coordinator,
+            "find_longest_cache_hit_per_group",
+            return_value=(([], []), (68, shared_gpu_hit)),
+        ),
+    ):
+        assert connector.get_num_new_matched_tokens(request, 16) == (48, True)
+
+    connector.scheduler.get_num_new_matched_tokens.assert_called_once_with(
+        request, 16, max_num_new_tokens=None, gpu_prefix_tokens=expected_gpu_prefix
+    )
 
 
 def test_hisparse_offloads_only_indexer_group():

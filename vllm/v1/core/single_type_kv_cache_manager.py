@@ -57,6 +57,7 @@ class SingleTypeKVCacheManager(ABC):
 
     # Keep this group's longer prefix until external cache lookup completes.
     retains_longer_hit: bool = False
+    retains_complete_hit: bool = False
 
     @property
     def has_positionally_stable_blocks(self) -> bool:
